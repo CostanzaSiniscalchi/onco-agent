@@ -17,7 +17,7 @@ os.makedirs("logs", exist_ok=True)
 _log_file = f"logs/run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 logging.basicConfig(
     level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="[%(levelname)s] %(message)s",
     handlers=[
         logging.FileHandler(_log_file),
         logging.StreamHandler(),
@@ -79,47 +79,58 @@ def pubmed_tool(state: AgentState):
 
 # --- 3. BRAIN: Researcher Node (Strict Grounding) ---
 def researcher_node(state: AgentState):
-    logger.info("[NODE: RESEARCHER] Synthesizing findings from context...")
+    logger.info("[NODE: RESEARCHER] Synthesizing findings...")
     results = state.get("pubmed_results", [])
     context = "\n".join(results)
+    
+    # Check if the last message was a REJECTION from the ref_check_node
+    last_msg_content = state["messages"][-1].content
+    retry_warning = ""
+    if "REJECT:" in last_msg_content:
+        retry_warning = f"\n\n⚠️ CRITICAL ERROR IN PREVIOUS TURN: {last_msg_content}\nYou MUST include the string 'PMID:' followed by the number for every fact. Example: (PMID: 41723914)."
 
-    if not context:
-        logger.warning("[NODE: RESEARCHER] No PubMed context available. Proceeding with empty context.")
-    else:
-        logger.debug("[NODE: RESEARCHER] Context length: %d characters.", len(context))
-
-    # If context is empty, we force the agent to admit it or ask for a new search
     system_msg = f"""You are a Clinical Oncology Assistant.
-    DATA CONTEXT:
-    {context if context else "NO DATA FOUND IN PUBMED."}
+    
+    DATA CONTEXT FROM PUBMED:
+    {context if context else "NO DATA FOUND."}
 
     STRICT RULES:
-    1. If CONTEXT is "NO DATA FOUND", you MUST say "I cannot find this information in PubMed. Please refine your search."
-    2. DO NOT use your internal training memory to name mutations.
-    3. Every claim MUST cite a PMID from the context.
-    4. Format your answer clearly."""
+    1. Every single claim MUST be followed by a citation in this exact format: (PMID: 12345678).
+    2. Use ONLY the provided context. If the info is missing, say "Data not found in context."
+    3. Do not use your own knowledge about drugs; use ONLY the PMIDs above.{retry_warning}
+    
+    Format the response as a bulleted list of findings."""
 
+    # We send the system message as a fresh instruction to keep it top-of-mind
     response = llm.invoke([HumanMessage(content=system_msg)] + state["messages"])
-    logger.info("[NODE: RESEARCHER] Response generated. Length: %d characters.", len(response.content))
-    return {"messages": [response]}
+    
+    # Clean DeepSeek <think> tags if they persist
+    clean_content = re.sub(r"<think>.*?</think>", "", response.content, flags=re.DOTALL).strip()
+    
+    return {"messages": [HumanMessage(content=clean_content)]}
 
 # --- 4. HARD CHECK: Reference Check ---
 def reference_check_node(state: AgentState):
     logger.info("[NODE: REFERENCE_CHECK] Auditing citations...")
+    
+    # The researcher's answer is the last message
     last_msg = state["messages"][-1].content
     context = "\n".join(state.get("pubmed_results", []))
 
-    cited = re.findall(r"PMID:?\s*(\d+)", last_msg)
-    available = re.findall(r"PMID:?\s*(\d+)", context)
-    logger.debug("Cited PMIDs: %s | Available PMIDs: %s", cited, available)
+    # Improved Regex: Catch 'PMID 123', 'PMID:123', '(PMID: 123)'
+    cited = re.findall(r"PMID:?\s*(\d+)", last_msg, re.IGNORECASE)
+    available = re.findall(r"PMID:?\s*(\d+)", context, re.IGNORECASE)
+    
+    # 1. Check for total absence of citations
+    if not cited:
+        return {"messages": [HumanMessage(content="REJECT: No PMIDs were cited. You must append (PMID: #######) to your statements.")]}
 
+    # 2. Check for hallucinations
     hallucinated = [p for p in cited if p not in available]
-
     if hallucinated:
-        logger.error("[NODE: REFERENCE_CHECK] FAILED - Fabricated PMIDs detected: %s", hallucinated)
-        return {"messages": [HumanMessage(content=f"REJECT: The PMIDs {hallucinated} are not in the provided source data.")]}
+        return {"messages": [HumanMessage(content=f"REJECT: The following PMIDs are fake or not in context: {hallucinated}. Use ONLY: {list(set(available))}")]}
 
-    logger.info("[NODE: REFERENCE_CHECK] PASSED - All %d cited PMIDs verified.", len(cited))
+    logger.info("[NODE: REFERENCE_CHECK] PASSED.")
     return {"messages": [HumanMessage(content="REF_CHECK_PASSED")]}
 
 # --- 5. JUDGE: Validator Node ---
